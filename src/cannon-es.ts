@@ -1,5 +1,6 @@
 export * from './collision/ObjectCollisionMatrix'
 export * from './collision/AABB'
+export * from './collision/AABBTreeBroadphase'
 export * from './collision/ArrayCollisionMatrix'
 export * from './collision/Broadphase'
 export * from './collision/GridBroadphase'

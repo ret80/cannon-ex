@@ -113,6 +113,20 @@ export class Body extends EventTarget {
   static sleepEvent = { type: 'sleep' }
 
   /**
+   * Dispatched when a body starts overlapping a trigger (sensor).
+   * The event object has a `.body` property with the other body.
+   * @event triggerEnter
+   */
+  static triggerEnterEvent = { type: 'triggerEnter' }
+
+  /**
+   * Dispatched when a body stops overlapping a trigger (sensor).
+   * The event object has a `.body` property with the other body.
+   * @event triggerExit
+   */
+  static triggerExitEvent = { type: 'triggerExit' }
+
+  /**
    * Identifier of the body.
    */
   id: number
@@ -325,11 +339,22 @@ export class Body extends EventTarget {
   boundingRadius: number
   wlambda: Vec3
   /**
-   * When true the body behaves like a trigger. It does not collide
-   * with other bodies but collision events are still triggered.
+   * When true the body behaves like a trigger (also known as a sensor). It does not
+   * collide with other bodies, no contact forces are generated, but overlap events
+   * are still emitted. Triggers emit `triggerEnter` / `triggerExit` on the involved
+   * bodies and `beginTrigger` / `endTrigger` on the world.
+   *
+   * A trigger should usually be static (mass 0) or kinematic, otherwise gravity and
+   * solver forces will move it like a normal body.
    * @default false
    */
   isTrigger: boolean
+
+  /**
+   * Set to false to exclude this body from continuous collision detection sweeps.
+   * @default true
+   */
+  ccdEnabled: boolean
 
   constructor(
     options: {
@@ -528,6 +553,7 @@ export class Body extends EventTarget {
     this.boundingRadius = 0
     this.wlambda = new Vec3()
     this.isTrigger = Boolean(options.isTrigger)
+    this.ccdEnabled = true
 
     if (options.shape) {
       this.addShape(options.shape)
@@ -923,7 +949,7 @@ export class Body extends EventTarget {
    * @return The result vector.
    */
   getVelocityAtWorldPoint(worldPoint: Vec3, result: Vec3): Vec3 {
-    const r = new Vec3()
+    const r = Body_getVelocityAtWorldPoint_r
     worldPoint.vsub(this.position, r)
     this.angularVelocity.cross(r, result)
     this.velocity.vadd(result, result)
@@ -1011,5 +1037,7 @@ const Body_applyImpulse_rotVelo = new Vec3()
 
 const Body_applyLocalImpulse_worldImpulse = new Vec3()
 const Body_applyLocalImpulse_relativePoint = new Vec3()
+
+const Body_getVelocityAtWorldPoint_r = new Vec3()
 
 const Body_updateMassProperties_halfExtents = new Vec3()

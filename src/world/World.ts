@@ -3,6 +3,7 @@ import { GSSolver } from '../solver/GSSolver'
 import { NaiveBroadphase } from '../collision/NaiveBroadphase'
 import { Narrowphase } from '../world/Narrowphase'
 import { Vec3 } from '../math/Vec3'
+import { Quaternion } from '../math/Quaternion'
 import { Material } from '../material/Material'
 import { ContactMaterial } from '../material/ContactMaterial'
 import { ArrayCollisionMatrix } from '../collision/ArrayCollisionMatrix'
@@ -12,7 +13,7 @@ import { RaycastResult } from '../collision/RaycastResult'
 import { Ray } from '../collision/Ray'
 import { AABB } from '../collision/AABB'
 import { Body } from '../objects/Body'
-import type { Broadphase } from '../collision/Broadphase'
+import { Broadphase } from '../collision/Broadphase'
 import type { Solver } from '../solver/Solver'
 import type { ContactEquation } from '../equations/ContactEquation'
 import type { FrictionEquation } from '../equations/FrictionEquation'
@@ -123,6 +124,12 @@ export class World extends EventTarget {
   shapeOverlapKeeper: OverlapKeeper
 
   /**
+   * Pairs of bodies where at least one of them is a trigger (sensor). Used to emit
+   * `beginTrigger` / `endTrigger` events.
+   */
+  sensorOverlapKeeper: OverlapKeeper
+
+  /**
    * All added contactmaterials.
    */
   contactmaterials: ContactMaterial[]
@@ -156,6 +163,29 @@ export class World extends EventTarget {
   accumulator: number
 
   subsystems: any[]
+
+  /**
+   * Enables continuous collision detection, which sweeps fast-moving bodies along
+   * their velocity so they cannot tunnel through other bodies in a single step.
+   * @default true
+   */
+  ccdEnabled: boolean
+
+  /**
+   * A body is swept when it moves more than this many times its bounding radius in a
+   * single step. Lower values are safer, higher values are cheaper.
+   * @default 1
+   */
+  ccdSpeedThreshold: number
+
+  /**
+   * Maximum number of samples taken along the path of a body to locate the time of
+   * impact. Only used for bodies flagged as fast by `.ccdSpeedThreshold`.
+   * @default 64
+   */
+  ccdMaxSamples: number
+
+  private ccdNarrowphase: Narrowphase
 
   /**
    * Dispatched after a body has been added to the world.
@@ -208,6 +238,16 @@ export class World extends EventTarget {
        * @default 0
        */
       quatNormalizeSkip?: number
+      /**
+       * Enables continuous collision detection for fast-moving bodies.
+       * @default true
+       */
+      ccd?: boolean
+      /**
+       * A body is swept when it moves more than this many times its bounding radius in a single step.
+       * @default 1
+       */
+      ccdSpeedThreshold?: number
     } = {}
   ) {
     super()
@@ -249,6 +289,11 @@ export class World extends EventTarget {
       friction: 0.3,
       restitution: 0.0,
     })
+    this.sensorOverlapKeeper = new OverlapKeeper()
+    this.ccdEnabled = options.ccd !== undefined ? options.ccd : true
+    this.ccdSpeedThreshold = options.ccdSpeedThreshold !== undefined ? options.ccdSpeedThreshold : 1
+    this.ccdMaxSamples = 64
+    this.ccdNarrowphase = new Narrowphase(this)
     this.doProfiling = false
     this.profile = {
       solve: 0,
@@ -285,6 +330,7 @@ export class World extends EventTarget {
 
     this.bodyOverlapKeeper.tick()
     this.shapeOverlapKeeper.tick()
+    this.sensorOverlapKeeper.tick()
   }
 
   /**
@@ -360,7 +406,7 @@ export class World extends EventTarget {
    * @todo Adding an array of bodies should be possible. This would save some loops too
    */
   addBody(body: Body): void {
-    if (this.bodies.includes(body)) {
+    if (body.world === this) {
       return
     }
     body.index = this.bodies.length
@@ -527,8 +573,6 @@ export class World extends EventTarget {
   internalStep(dt: number): void {
     this.dt = dt
 
-    const world = this
-    const that = this
     const contacts = this.contacts
     const p1 = World_step_p1
     const p2 = World_step_p2
@@ -807,6 +851,11 @@ export class World extends EventTarget {
     // Remove all contacts from solver
     solver.removeAllEquations()
 
+    // Continuous collision detection, before the bodies are integrated
+    if (this.ccdEnabled) {
+      this.applyCCD(dt)
+    }
+
     // Apply damping, see http://code.google.com/p/bullet/issues/detail?id=74 for details
     const pow = Math.pow
     for (i = 0; i !== N; i++) {
@@ -868,6 +917,207 @@ export class World extends EventTarget {
     this.hasActiveBodies = hasActiveBodies
   }
 
+  /**
+   * Continuous collision detection for fast-moving dynamic bodies.
+   *
+   * The body is swept along its linear velocity for this step, the first time of
+   * impact is located by sampling plus bisection (this reuses the regular narrowphase,
+   * so every supported shape pair keeps working), and the body is placed just before
+   * the impact with its velocity projected onto the contact plane. The normal component
+   * is removed rather than reflected, the discrete solver then resolves the resting
+   * contact on the following steps.
+   *
+   * Rotation is not swept and triggers never stop a body, so a fast body can still pass
+   * through a sensor in a single step.
+   */
+  private applyCCD(dt: number): void {
+    // Some broadphases (e.g. GridBroadphase) cannot answer overlap queries
+    if (this.broadphase.aabbQuery === Broadphase.prototype.aabbQuery) {
+      return
+    }
+
+    const bodies = this.bodies
+    const threshold = this.ccdSpeedThreshold
+    const maxSamples = this.ccdMaxSamples
+
+    for (let i = 0, N = bodies.length; i !== N; i++) {
+      const bi = bodies[i]
+
+      if (!bi.ccdEnabled || bi.type !== Body.DYNAMIC || bi.sleepState === Body.SLEEPING) {
+        continue
+      }
+
+      const radius = bi.boundingRadius
+      if (radius <= 0) {
+        continue
+      }
+
+      const velocity = bi.velocity
+      const distance = velocity.length() * dt
+
+      // Discrete collision detection is accurate enough for slow bodies
+      if (distance <= threshold * radius) {
+        continue
+      }
+
+      if (bi.aabbNeedsUpdate) {
+        bi.updateAABB()
+      }
+
+      const startPosition = ccd_startPosition.copy(bi.position)
+      const startQuaternion = ccd_startQuaternion.copy(bi.quaternion)
+      const endQuaternion = ccd_endQuaternion.copy(bi.quaternion)
+
+      // Query the broadphase with the volume swept by the body during the step
+      const displacement = velocity.scale(dt, ccd_displacement)
+      const swept = ccd_sweptAABB
+      const aabb = bi.aabb
+      swept.lowerBound.x = Math.min(aabb.lowerBound.x, aabb.lowerBound.x + displacement.x)
+      swept.lowerBound.y = Math.min(aabb.lowerBound.y, aabb.lowerBound.y + displacement.y)
+      swept.lowerBound.z = Math.min(aabb.lowerBound.z, aabb.lowerBound.z + displacement.z)
+      swept.upperBound.x = Math.max(aabb.upperBound.x, aabb.upperBound.x + displacement.x)
+      swept.upperBound.y = Math.max(aabb.upperBound.y, aabb.upperBound.y + displacement.y)
+      swept.upperBound.z = Math.max(aabb.upperBound.z, aabb.upperBound.z + displacement.z)
+
+      const candidates = ccd_candidates
+      candidates.length = 0
+      this.broadphase.aabbQuery(this, swept, candidates)
+
+      let bestT = 1
+      let bestNormal = null as Vec3 | null
+
+      if (candidates.length !== 0) {
+        // Sample at most one point per bounding radius, so a thin obstacle cannot be
+        // skipped between two samples.
+        const samples = Math.min(maxSamples, Math.max(1, Math.ceil(distance / (threshold * radius))))
+        const sampleStep = 1 / samples
+
+        for (let c = 0, Nc = candidates.length; c !== Nc; c++) {
+          const bj = candidates[c]
+
+          if (bj === bi || bj.isTrigger || !this.broadphase.needBroadphaseCollision(bi, bj)) {
+            continue
+          }
+
+          // Find the first sample where the two bodies overlap
+          let hitT = -1
+          let previousT = 0
+          for (let s = 1; s <= samples; s++) {
+            const t = s * sampleStep
+            if (this.ccdTestOverlap(bi, bj, startPosition, startQuaternion, endQuaternion, t, displacement)) {
+              hitT = t
+              break
+            }
+            previousT = t
+          }
+
+          if (hitT < 0) {
+            continue
+          }
+
+          // Refine the time of impact
+          let lo = previousT
+          let hi = hitT
+          for (let k = 0; k !== 8; k++) {
+            const mid = (lo + hi) * 0.5
+            if (this.ccdTestOverlap(bi, bj, startPosition, startQuaternion, endQuaternion, mid, displacement)) {
+              hi = mid
+            } else {
+              lo = mid
+            }
+          }
+
+          if (hi < bestT) {
+            bestT = hi
+            bestNormal = ccd_bestNormal.copy(ccd_hitNormal)
+          }
+        }
+      }
+
+      bi.quaternion.copy(startQuaternion)
+
+      if (bestNormal && bestT < 1) {
+        // Place the body just before the impact, with a small skin so the next
+        // narrowphase pass sees a (tiny) overlap instead of a gap.
+        const t = Math.max(0, bestT - 1e-4)
+        startPosition.addScaledVector(t, displacement, bi.position)
+
+        // Cancel the velocity along the contact normal
+        const vn = velocity.dot(bestNormal)
+        if (vn > 0) {
+          velocity.x -= bestNormal.x * vn
+          velocity.y -= bestNormal.y * vn
+          velocity.z -= bestNormal.z * vn
+        }
+
+        // Later sweeps in this step must see the new position
+        this.broadphase.dirty = true
+      } else {
+        bi.position.copy(startPosition)
+      }
+
+      bi.aabbNeedsUpdate = true
+    }
+  }
+
+  /**
+   * Test if two bodies overlap at the given fraction of the swept movement.
+   * The pose of `bi` is written to and left at the tested pose, the caller must restore it.
+   */
+  private ccdTestOverlap(
+    bi: Body,
+    bj: Body,
+    startPosition: Vec3,
+    startQuaternion: Quaternion,
+    endQuaternion: Quaternion,
+    t: number,
+    displacement: Vec3
+  ): boolean {
+    startPosition.addScaledVector(t, displacement, ccd_testPosition)
+    startQuaternion.slerp(endQuaternion, t, ccd_testQuaternion)
+
+    bi.position.copy(ccd_testPosition)
+    bi.quaternion.copy(ccd_testQuaternion)
+    bi.aabbNeedsUpdate = true
+
+    const contacts = ccd_contacts
+    const frictionEquations = ccd_frictionEquations
+    contacts.length = 0
+    frictionEquations.length = 0
+
+    const narrowphase = this.ccdNarrowphase
+    narrowphase.result = contacts
+    narrowphase.frictionResult = frictionEquations
+
+    ccd_pairA[0] = bi
+    ccd_pairB[0] = bj
+    narrowphase.getContacts(ccd_pairA, ccd_pairB, this, contacts, ccd_contactPool, frictionEquations, ccd_frictionPool)
+
+    const hasHit = contacts.length !== 0
+
+    if (hasHit) {
+      const contact = contacts[0]
+      // `ni` points from contact.bi towards contact.bj, normalize the direction to bi -> bj
+      if (contact.bi === bi) {
+        ccd_hitNormal.copy(contact.ni)
+      } else {
+        contact.ni.negate(ccd_hitNormal)
+      }
+    }
+
+    // Recycle the equations that were only created to test the overlap
+    for (let i = 0, l = contacts.length; i < l; i++) {
+      ccd_contactPool.push(contacts[i])
+    }
+    for (let i = 0, l = frictionEquations.length; i < l; i++) {
+      ccd_frictionPool.push(frictionEquations[i])
+    }
+    contacts.length = 0
+    frictionEquations.length = 0
+
+    return hasHit
+  }
+
   emitContactEvents(): void {
     const hasBeginContact = this.hasAnyEventListener('beginContact')
     const hasEndContact = this.hasAnyEventListener('endContact')
@@ -895,6 +1145,54 @@ export class World extends EventTarget {
     }
 
     additions.length = removals.length = 0
+
+    // Trigger (sensor) overlap events. "beginTrigger" / "endTrigger" on the world
+    // and "triggerEnter" / "triggerExit" on each of the two bodies.
+    const sensorOverlapKeeper = this.sensorOverlapKeeper
+    if (sensorOverlapKeeper.current.length !== 0 || sensorOverlapKeeper.previous.length !== 0) {
+      sensorOverlapKeeper.getDiff(additions, removals)
+
+      for (let i = 0, l = additions.length; i < l; i += 2) {
+        const bodyA = this.getBodyById(additions[i])
+        const bodyB = this.getBodyById(additions[i + 1])
+        if (!bodyA || !bodyB) {
+          continue
+        }
+
+        triggerEnterEvent.bodyA = bodyA
+        triggerEnterEvent.bodyB = bodyB
+        this.dispatchEvent(triggerEnterEvent)
+
+        bodyTriggerEvent.type = Body.triggerEnterEvent.type
+        bodyTriggerEvent.body = bodyB
+        bodyA.dispatchEvent(bodyTriggerEvent)
+        bodyTriggerEvent.body = bodyA
+        bodyB.dispatchEvent(bodyTriggerEvent)
+      }
+
+      for (let i = 0, l = removals.length; i < l; i += 2) {
+        const bodyA = this.getBodyById(removals[i])
+        const bodyB = this.getBodyById(removals[i + 1])
+        if (!bodyA || !bodyB) {
+          continue
+        }
+
+        triggerExitEvent.bodyA = bodyA
+        triggerExitEvent.bodyB = bodyB
+        this.dispatchEvent(triggerExitEvent)
+
+        bodyTriggerEvent.type = Body.triggerExitEvent.type
+        bodyTriggerEvent.body = bodyB
+        bodyA.dispatchEvent(bodyTriggerEvent)
+        bodyTriggerEvent.body = bodyA
+        bodyB.dispatchEvent(bodyTriggerEvent)
+      }
+
+      triggerEnterEvent.bodyA = triggerEnterEvent.bodyB = null
+      triggerExitEvent.bodyA = triggerExitEvent.bodyB = null
+      bodyTriggerEvent.body = null
+      additions.length = removals.length = 0
+    }
 
     const hasBeginShapeContact = this.hasAnyEventListener('beginShapeContact')
     const hasEndShapeContact = this.hasAnyEventListener('endShapeContact')
@@ -989,6 +1287,33 @@ const World_step_collideEvent: {
 // Pools for unused objects
 const World_step_oldContacts: ContactEquation[] = []
 const World_step_frictionEquationPool: FrictionEquation[] = []
+
+// Continuous collision detection scratch objects
+const ccd_startPosition = new Vec3()
+const ccd_startQuaternion = new Quaternion()
+const ccd_endQuaternion = new Quaternion()
+const ccd_testPosition = new Vec3()
+const ccd_testQuaternion = new Quaternion()
+const ccd_displacement = new Vec3()
+const ccd_sweptAABB = new AABB()
+const ccd_hitNormal = new Vec3()
+const ccd_bestNormal = new Vec3()
+const ccd_candidates: Body[] = []
+const ccd_contacts: ContactEquation[] = []
+const ccd_frictionEquations: FrictionEquation[] = []
+const ccd_contactPool: ContactEquation[] = []
+const ccd_frictionPool: FrictionEquation[] = []
+const ccd_pairA: Body[] = []
+const ccd_pairB: Body[] = []
+
+type TriggerEvent = {
+  type: string
+  bodyA: Body | null
+  bodyB: Body | null
+}
+const triggerEnterEvent: TriggerEvent = { type: 'beginTrigger', bodyA: null, bodyB: null }
+const triggerExitEvent: TriggerEvent = { type: 'endTrigger', bodyA: null, bodyB: null }
+const bodyTriggerEvent: { type: string; body: Body | null } = { type: Body.triggerEnterEvent.type, body: null }
 
 // Reusable arrays for collision pairs
 const World_step_p1: Body[] = []

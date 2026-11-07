@@ -147,11 +147,8 @@ export class AABB {
     // |--------|
     // l1       u1
 
-    const overlapsX = (l2.x <= u1.x && u1.x <= u2.x) || (l1.x <= u2.x && u2.x <= u1.x)
-    const overlapsY = (l2.y <= u1.y && u1.y <= u2.y) || (l1.y <= u2.y && u2.y <= u1.y)
-    const overlapsZ = (l2.z <= u1.z && u1.z <= u2.z) || (l1.z <= u2.z && u2.z <= u1.z)
-
-    return overlapsX && overlapsY && overlapsZ
+    // Two intervals overlap if neither one is fully separated from the other.
+    return l1.x <= u2.x && l2.x <= u1.x && l1.y <= u2.y && l2.y <= u1.y && l1.z <= u2.z && l2.z <= u1.z
   }
 
   // Mostly for debugging

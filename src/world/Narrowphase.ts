@@ -367,7 +367,39 @@ export class Narrowphase {
             continue
           }
 
-          if (xi.distanceTo(xj) > si.boundingSphereRadius + sj.boundingSphereRadius) {
+          if (xi.distanceSquared(xj) > (si.boundingSphereRadius + sj.boundingSphereRadius) ** 2) {
+            continue
+          }
+
+          const resolverIndex = (si.type | sj.type) as CollisionType
+          const resolver = this[resolverIndex]
+          if (!resolver) {
+            continue
+          }
+
+          // Sensors (triggers) detect overlaps but must never create contact equations.
+          if (bi.isTrigger || bj.isTrigger) {
+            const resultLength = this.result.length
+            const frictionResultLength = this.frictionResult.length
+            let overlap: boolean | void
+
+            // TO DO: investigate why sphereParticle and convexParticle
+            // resolvers expect si and sj shapes to be in reverse order
+            // (i.e. larger integer value type first instead of smaller first)
+            if (si.type < sj.type) {
+              overlap = (resolver as any).call(this, si, sj, xi, xj, qi, qj, bi, bj, si, sj, true)
+            } else {
+              overlap = (resolver as any).call(this, sj, si, xj, xi, qj, qi, bj, bi, si, sj, true)
+            }
+
+            // Some resolvers may ignore the "just test" flag and push equations anyway.
+            const isOverlapping = overlap === true || this.result.length > resultLength
+            this.result.length = resultLength
+            this.frictionResult.length = frictionResultLength
+
+            if (isOverlapping) {
+              world.sensorOverlapKeeper.set(bi.id, bj.id)
+            }
             continue
           }
 
@@ -379,26 +411,21 @@ export class Narrowphase {
 
           this.currentContactMaterial = shapeContactMaterial || bodyContactMaterial || world.defaultContactMaterial
 
-          // Get contacts
-          const resolverIndex = (si.type | sj.type) as CollisionType
-          const resolver = this[resolverIndex]
-          if (resolver) {
-            let retval = false
+          let retval = false
 
-            // TO DO: investigate why sphereParticle and convexParticle
-            // resolvers expect si and sj shapes to be in reverse order
-            // (i.e. larger integer value type first instead of smaller first)
-            if (si.type < sj.type) {
-              retval = (resolver as any).call(this, si, sj, xi, xj, qi, qj, bi, bj, si, sj, justTest)
-            } else {
-              retval = (resolver as any).call(this, sj, si, xj, xi, qj, qi, bj, bi, si, sj, justTest)
-            }
+          // TO DO: investigate why sphereParticle and convexParticle
+          // resolvers expect si and sj shapes to be in reverse order
+          // (i.e. larger integer value type first instead of smaller first)
+          if (si.type < sj.type) {
+            retval = (resolver as any).call(this, si, sj, xi, xj, qi, qj, bi, bj, si, sj, justTest)
+          } else {
+            retval = (resolver as any).call(this, sj, si, xj, xi, qj, qi, bj, bi, si, sj, justTest)
+          }
 
-            if (retval && justTest) {
-              // Register overlap
-              world.shapeOverlapKeeper.set(si.id, sj.id)
-              world.bodyOverlapKeeper.set(bi.id, bj.id)
-            }
+          if (retval && justTest) {
+            // Register overlap
+            world.shapeOverlapKeeper.set(si.id, sj.id)
+            world.bodyOverlapKeeper.set(bi.id, bj.id)
           }
         }
       }

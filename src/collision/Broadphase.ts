@@ -150,11 +150,12 @@ export class Broadphase {
    * Check if the bounding spheres of two bodies overlap.
    */
   static boundingSphereCheck(bodyA: Body, bodyB: Body): boolean {
-    const dist = new Vec3() // bsc_dist;
+    const dist = bsc_dist
     bodyA.position.vsub(bodyB.position, dist)
     const sa = bodyA.shapes[0]
     const sb = bodyB.shapes[0]
-    return Math.pow(sa.boundingSphereRadius + sb.boundingSphereRadius, 2) > dist.lengthSquared()
+    const sum = sa.boundingSphereRadius + sb.boundingSphereRadius
+    return sum * sum > dist.lengthSquared()
   }
 
   /**

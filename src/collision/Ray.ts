@@ -315,10 +315,10 @@ export class Ray {
     const direction = this.direction
 
     // Get plane normal
-    const worldNormal = new Vec3(0, 0, 1)
+    const worldNormal = Ray_intersectPlane_worldNormal.set(0, 0, 1)
     quat.vmult(worldNormal, worldNormal)
 
-    const len = new Vec3()
+    const len = Ray_intersectPlane_len
     from.vsub(position, len)
     const planeToFrom = len.dot(worldNormal)
     to.vsub(position, len)
@@ -340,9 +340,9 @@ export class Ray {
       return
     }
 
-    const planePointToFrom = new Vec3()
-    const dir_scaled_with_t = new Vec3()
-    const hitPointWorld = new Vec3()
+    const planePointToFrom = from.vsub(position)
+    const dir_scaled_with_t = Ray_intersectPlane_dirScaledWithT
+    const hitPointWorld = Ray_intersectPlane_hitPointWorld
 
     from.vsub(position, planePointToFrom)
     const t = -worldNormal.dot(planePointToFrom) / n_dot_dir
@@ -784,6 +784,11 @@ const intersectHeightfield_minMax = []
 
 const Ray_intersectSphere_intersectionPoint = new Vec3()
 const Ray_intersectSphere_normal = new Vec3()
+
+const Ray_intersectPlane_worldNormal = new Vec3()
+const Ray_intersectPlane_len = new Vec3()
+const Ray_intersectPlane_dirScaledWithT = new Vec3()
+const Ray_intersectPlane_hitPointWorld = new Vec3()
 
 const intersectConvex_normal = new Vec3()
 const intersectConvex_minDistNormal = new Vec3()
