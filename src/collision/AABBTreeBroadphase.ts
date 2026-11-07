@@ -98,9 +98,9 @@ export class AABBTreeBroadphase extends Broadphase {
   }
 
   /**
-   * Change the world.
+   * Change the world. Pass `null` to detach from the current world.
    */
-  setWorld(world: World): void {
+  setWorld(world: World | null): void {
     if (this.world) {
       this.world.removeEventListener('addBody', this._addBodyHandler)
       this.world.removeEventListener('removeBody', this._removeBodyHandler)
@@ -110,6 +110,11 @@ export class AABBTreeBroadphase extends Broadphase {
     this.bodyToLeaf.clear()
     this.nodePool.length = 0
     this.world = world
+    this.dirty = true
+
+    if (!world) {
+      return
+    }
 
     world.addEventListener('addBody', this._addBodyHandler)
     world.addEventListener('removeBody', this._removeBodyHandler)
@@ -117,8 +122,6 @@ export class AABBTreeBroadphase extends Broadphase {
     for (let i = 0; i < world.bodies.length; i++) {
       this.insertBody(world.bodies[i])
     }
-
-    this.dirty = true
   }
 
   /**

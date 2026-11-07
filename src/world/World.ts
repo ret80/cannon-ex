@@ -1,6 +1,6 @@
 import { EventTarget } from '../utils/EventTarget'
 import { GSSolver } from '../solver/GSSolver'
-import { NaiveBroadphase } from '../collision/NaiveBroadphase'
+import { AABBTreeBroadphase } from '../collision/AABBTreeBroadphase'
 import { Narrowphase } from '../world/Narrowphase'
 import { Vec3 } from '../math/Vec3'
 import { Quaternion } from '../math/Quaternion'
@@ -87,11 +87,32 @@ export class World extends EventTarget {
    */
   frictionGravity?: Vec3
 
+  private _broadphase: Broadphase
+
   /**
-   * The broadphase algorithm to use.
-   * @default NaiveBroadphase
+   * The broadphase algorithm to use. Assigning a new broadphase detaches the
+   * previous one from this world, so its body listeners are removed.
+   * @default AABBTreeBroadphase
    */
-  broadphase: Broadphase
+  get broadphase(): Broadphase {
+    return this._broadphase
+  }
+
+  set broadphase(broadphase: Broadphase) {
+    if (broadphase === this._broadphase) {
+      return
+    }
+
+    if (this._broadphase) {
+      this._broadphase.setWorld(null)
+    }
+
+    this._broadphase = broadphase
+
+    if (this.bodies) {
+      broadphase.setWorld(this)
+    }
+  }
 
   /**
    * All bodies in this world
@@ -219,7 +240,7 @@ export class World extends EventTarget {
       allowSleep?: boolean
       /**
        * The broadphase algorithm to use.
-       * @default NaiveBroadphase
+       * @default AABBTreeBroadphase
        */
       broadphase?: Broadphase
       /**
@@ -272,7 +293,7 @@ export class World extends EventTarget {
       this.frictionGravity.copy(options.frictionGravity)
     }
 
-    this.broadphase = options.broadphase !== undefined ? options.broadphase : new NaiveBroadphase()
+    this._broadphase = options.broadphase !== undefined ? options.broadphase : new AABBTreeBroadphase()
     this.bodies = []
     this.hasActiveBodies = false
     this.solver = options.solver !== undefined ? options.solver : new GSSolver()

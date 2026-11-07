@@ -99,8 +99,8 @@
         const world = demo.getWorld()
         world.gravity.set(0, -50, 0)
 
-        // Uncomment to try the SAPBroadphase instead of
-        // the default NaiveBroadphase
+        // The default broadphase is AABBTreeBroadphase.
+        // Uncomment to try the sweep and prune broadphase instead.
         // world.broadphase = new CANNON.SAPBroadphase(world)
 
         // Max solver iterations: Use more for better force propagation, but keep in mind that it's not very computationally cheap!

@@ -158,6 +158,7 @@ const implementations: Array<{ name: string; ctor: new () => Broadphase }> = [
 ]
 
 console.log(`collisionPairs(): ${STEPS} steps after ${WARMUP} warmup steps`)
+console.log(`World's default broadphase is AABBTreeBroadphase`)
 console.log(`"moving" gives each body a constant velocity, "jitter" reverses direction every step\n`)
 
 for (const scenario of scenarios) {

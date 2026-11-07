@@ -142,9 +142,9 @@ export class Broadphase {
   }
 
   /**
-   * To be implemented by subcasses
+   * To be implemented by subclasses. Pass `null` to detach from a world.
    */
-  setWorld(world: World): void {}
+  setWorld(world: World | null): void {}
 
   /**
    * Check if the bounding spheres of two bodies overlap.

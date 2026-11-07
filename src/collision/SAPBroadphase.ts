@@ -134,27 +134,33 @@ export class SAPBroadphase extends Broadphase {
   }
 
   /**
-   * Change the world
+   * Change the world. Pass `null` to detach from the current world.
    */
-  setWorld(world: World): void {
+  setWorld(world: World | null): void {
     // Clear the old axis array
     this.axisList.length = 0
+
+    // Remove old handlers, if any
+    if (this.world) {
+      this.world.removeEventListener('addBody', this._addBodyHandler)
+      this.world.removeEventListener('removeBody', this._removeBodyHandler)
+    }
+
+    this.world = world
+    this.dirty = true
+
+    if (!world) {
+      return
+    }
 
     // Add all bodies from the new world
     for (let i = 0; i < world.bodies.length; i++) {
       this.axisList.push(world.bodies[i])
     }
 
-    // Remove old handlers, if any
-    world.removeEventListener('addBody', this._addBodyHandler)
-    world.removeEventListener('removeBody', this._removeBodyHandler)
-
     // Add handlers to update the list of bodies.
     world.addEventListener('addBody', this._addBodyHandler)
     world.addEventListener('removeBody', this._removeBodyHandler)
-
-    this.world = world
-    this.dirty = true
   }
 
   /**

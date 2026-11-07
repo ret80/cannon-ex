@@ -1,9 +1,13 @@
 import type { Shape } from '../shapes/Shape'
 import { Vec3 } from '../math/Vec3'
+import { Quaternion } from '../math/Quaternion'
 import { Box } from '../shapes/Box'
+import { Plane } from '../shapes/Plane'
 import { Sphere } from '../shapes/Sphere'
 import { Body } from '../objects/Body'
 import { World } from '../world/World'
+import { AABBTreeBroadphase } from '../collision/AABBTreeBroadphase'
+import { SAPBroadphase } from '../collision/SAPBroadphase'
 import { ArrayCollisionMatrix } from '../collision/ArrayCollisionMatrix'
 import { ObjectCollisionMatrix } from '../collision/ObjectCollisionMatrix'
 import { RaycastResult } from '../collision/RaycastResult'
@@ -12,6 +16,47 @@ import { Material } from '../material/Material'
 import { ContactMaterial } from '../material/ContactMaterial'
 
 describe('World', () => {
+  test('uses AABBTreeBroadphase by default', () => {
+    const world = new World()
+
+    expect(world.broadphase).toBeInstanceOf(AABBTreeBroadphase)
+    expect((world.broadphase as AABBTreeBroadphase).world).toBe(world)
+  })
+
+  test('default broadphase detects collisions', () => {
+    const world = new World({ gravity: new Vec3(0, -9.81, 0) })
+
+    const ground = new Body({
+      mass: 0,
+      shape: new Plane(),
+      quaternion: new Quaternion().setFromAxisAngle(new Vec3(1, 0, 0), -Math.PI / 2),
+    })
+    const ball = new Body({ mass: 1, shape: new Sphere(0.5), position: new Vec3(0, 2, 0) })
+
+    world.addBody(ground)
+    world.addBody(ball)
+
+    for (let i = 0; i < 120; i++) {
+      world.step(1 / 60)
+    }
+
+    expect(ball.position.y).toBeGreaterThan(0.4)
+    expect(ball.position.y).toBeLessThan(0.6)
+  })
+
+  test('replacing the broadphase detaches the previous one', () => {
+    const world = new World()
+    const previous = world.broadphase
+    const sap = new SAPBroadphase(world)
+
+    world.broadphase = sap
+
+    world.addBody(new Body({ mass: 1, shape: new Sphere(1) }))
+
+    expect(world.broadphase).toBe(sap)
+    expect((previous as AABBTreeBroadphase).root).toBeNull()
+  })
+
   test('clearForces', () => {
     const world = new World()
     const body = new Body()
