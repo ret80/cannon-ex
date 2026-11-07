@@ -23,6 +23,22 @@ import type { Shape } from '../shapes/Shape'
 
 export type WorldOptions = ConstructorParameters<typeof World>[0]
 
+/** Options for shape overlap queries (`World.intersectShape`). */
+export type ShapeQueryOptions = {
+  /** Collision filter group of the query. @default 1 */
+  collisionFilterGroup?: number
+  /** Collision filter mask of the query. @default -1 */
+  collisionFilterMask?: number
+  /** A body that should never be reported. */
+  ignoreBody?: Body | null
+}
+
+/** Options for shape casts (`World.castShape`). */
+export type ShapeCastOptions = ShapeQueryOptions & {
+  /** Maximum number of samples taken along the sweep. @default 64 */
+  maxSamples?: number
+}
+
 /**
  * The physics world
  */
@@ -209,6 +225,32 @@ export class World extends EventTarget {
   private ccdNarrowphase: Narrowphase
 
   /**
+   * Scratch state for shape queries. Reused between calls so queries do not allocate.
+   */
+  private queryBody: Body = new Body()
+  private queryNarrowphase: Narrowphase
+  private queryAABB = new AABB()
+  private queryCandidates: Body[] = []
+  private queryPairA: Body[] = []
+  private queryPairB: Body[] = []
+  private queryContacts: ContactEquation[] = []
+  private queryFrictionEquations: FrictionEquation[] = []
+  private queryContactPool: ContactEquation[] = []
+  private queryFrictionPool: FrictionEquation[] = []
+  private queryShapeOffset = new Vec3()
+  private queryShapeOrientation = new Quaternion()
+  private queryShapePosition = new Vec3()
+  private queryShapeQuaternion = new Quaternion()
+  private queryTmpLower = new Vec3()
+  private queryTmpUpper = new Vec3()
+  private queryTmpPosition = new Vec3()
+  private queryCastPosition = new Vec3()
+  private queryTmpQuaternion = new Quaternion()
+  private queryDisplacement = new Vec3()
+  private queryHitNormal = new Vec3()
+  private queryHitPoint = new Vec3()
+
+  /**
    * Dispatched after a body has been added to the world.
    */
   addBodyEvent: { type: 'addBody'; body: Body | null }
@@ -315,6 +357,7 @@ export class World extends EventTarget {
     this.ccdSpeedThreshold = options.ccdSpeedThreshold !== undefined ? options.ccdSpeedThreshold : 1
     this.ccdMaxSamples = 64
     this.ccdNarrowphase = new Narrowphase(this)
+    this.queryNarrowphase = new Narrowphase(this)
     this.doProfiling = false
     this.profile = {
       solve: 0,
@@ -419,6 +462,272 @@ export class World extends EventTarget {
     options.to = to
     options.result = result
     return tmpRay.intersectWorld(this, options)
+  }
+
+  /**
+   * Find all bodies that overlap a shape placed at the given world transform.
+   * The broadphase AABB tree is used to find candidates, then the narrowphase runs the
+   * usual shape pair test. The query shape's own collision filters apply as usual.
+   *
+   * @example
+   *     const bodies = world.intersectShape(new CANNON.Sphere(1), new CANNON.Vec3(0, 1, 0), new CANNON.Quaternion())
+   */
+  intersectShape(
+    shape: Shape,
+    position: Vec3,
+    quaternion: Quaternion = new Quaternion(),
+    options: ShapeQueryOptions = {},
+    result: Body[] = []
+  ): Body[] {
+    result.length = 0
+
+    this.queryShapePosition.copy(position)
+    this.queryShapeQuaternion.copy(quaternion)
+
+    const aabb = this.queryAABB
+    shape.calculateWorldAABB(this.queryShapePosition, this.queryShapeQuaternion, aabb.lowerBound, aabb.upperBound)
+
+    const candidates = this.queryCandidates
+    candidates.length = 0
+    this.broadphase.aabbQuery(this, aabb, candidates)
+
+    for (let i = 0; i < candidates.length; i++) {
+      const body = candidates[i]
+      if (!this.matchesShapeQuery(body, options)) {
+        continue
+      }
+
+      if (this.bodyOverlapsShape(body, shape, this.queryShapePosition, this.queryShapeQuaternion)) {
+        result.push(body)
+      }
+    }
+
+    return result
+  }
+
+  /**
+   * Sweep a shape from `from` to `to` and report the first body it hits.
+   *
+   * The sweep is sampled (at most one sample per half bounding radius, capped by
+   * `options.maxSamples`) and refined with bisection, in the same way as the continuous
+   * collision detection. Rotation is not swept.
+   *
+   * @example
+   *     const result = new CANNON.RaycastResult()
+   *     if (world.castShape(new CANNON.Sphere(0.5), from, to, new CANNON.Quaternion(), {}, result)) {
+   *       console.log(result.body, result.hitPointWorld, result.hitNormalWorld)
+   *     }
+   */
+  castShape(
+    shape: Shape,
+    from: Vec3,
+    to: Vec3,
+    quaternion: Quaternion = new Quaternion(),
+    options: ShapeCastOptions = {},
+    result: RaycastResult = new RaycastResult()
+  ): boolean {
+    result.reset()
+
+    this.queryShapePosition.copy(from)
+    this.queryShapeQuaternion.copy(quaternion)
+
+    to.vsub(from, this.queryDisplacement)
+    const displacement = this.queryDisplacement
+    const length = displacement.length()
+    const maxSamples = options.maxSamples !== undefined ? options.maxSamples : 64
+
+    // AABB of the whole swept volume.
+    const swept = this.queryAABB
+    shape.calculateWorldAABB(from, quaternion, swept.lowerBound, swept.upperBound)
+    shape.calculateWorldAABB(to, quaternion, this.queryTmpLower, this.queryTmpUpper)
+    swept.lowerBound.x = Math.min(swept.lowerBound.x, this.queryTmpLower.x)
+    swept.lowerBound.y = Math.min(swept.lowerBound.y, this.queryTmpLower.y)
+    swept.lowerBound.z = Math.min(swept.lowerBound.z, this.queryTmpLower.z)
+    swept.upperBound.x = Math.max(swept.upperBound.x, this.queryTmpUpper.x)
+    swept.upperBound.y = Math.max(swept.upperBound.y, this.queryTmpUpper.y)
+    swept.upperBound.z = Math.max(swept.upperBound.z, this.queryTmpUpper.z)
+
+    const candidates = this.queryCandidates
+    candidates.length = 0
+    this.broadphase.aabbQuery(this, swept, candidates)
+
+    const step = Math.max(shape.boundingSphereRadius * 0.5, 1e-3)
+    const samples = Math.min(maxSamples, Math.max(1, Math.ceil(length / step)))
+
+    let bestT = 1
+    let bestBody: Body | null = null
+
+    for (let c = 0; c < candidates.length; c++) {
+      const body = candidates[c]
+      if (!this.matchesShapeQuery(body, options)) {
+        continue
+      }
+
+      let hitT = -1
+      let previousT = 0
+
+      for (let s = 1; s <= samples; s++) {
+        const t = s / samples
+        from.addScaledVector(t, displacement, this.queryCastPosition)
+        if (this.bodyOverlapsShape(body, shape, this.queryCastPosition, quaternion)) {
+          hitT = t
+          break
+        }
+        previousT = t
+      }
+
+      if (hitT < 0) {
+        continue
+      }
+
+      // Refine the time of impact.
+      let lo = previousT
+      let hi = hitT
+      for (let k = 0; k < 8; k++) {
+        const mid = (lo + hi) * 0.5
+        from.addScaledVector(mid, displacement, this.queryCastPosition)
+        if (this.bodyOverlapsShape(body, shape, this.queryCastPosition, quaternion)) {
+          hi = mid
+        } else {
+          lo = mid
+        }
+      }
+
+      if (hi < bestT) {
+        bestT = hi
+        bestBody = body
+      }
+    }
+
+    if (!bestBody) {
+      return false
+    }
+
+    // Get the contact point and normal at the time of impact.
+    from.addScaledVector(bestT, displacement, this.queryCastPosition)
+    this.setQueryShape(shape, this.queryCastPosition, quaternion)
+
+    const narrowphase = this.queryNarrowphase
+    const contacts = this.queryContacts
+    const frictionEquations = this.queryFrictionEquations
+    contacts.length = 0
+    frictionEquations.length = 0
+    narrowphase.result = contacts
+    narrowphase.frictionResult = frictionEquations
+
+    this.queryPairA[0] = this.queryBody
+    this.queryPairB[0] = bestBody
+    narrowphase.getContacts(
+      this.queryPairA,
+      this.queryPairB,
+      this,
+      contacts,
+      this.queryContactPool,
+      frictionEquations,
+      this.queryFrictionPool
+    )
+
+    const normal = this.queryHitNormal
+    const point = this.queryHitPoint
+    if (contacts.length !== 0) {
+      const contact = contacts[0]
+      if (contact.bi === this.queryBody) {
+        // `ni` points from the query shape to the hit body, the surface normal points back.
+        contact.ni.negate(normal)
+        this.queryBody.position.vadd(contact.ri, point)
+      } else {
+        normal.copy(contact.ni)
+        bestBody.position.vadd(contact.rj, point)
+      }
+    } else {
+      // Touching contact, no penetration: fall back to the sweep direction.
+      normal.copy(displacement)
+      normal.normalize()
+      normal.negate(normal)
+      point.copy(this.queryCastPosition)
+    }
+
+    for (let i = 0; i < contacts.length; i++) {
+      this.queryContactPool.push(contacts[i])
+    }
+    for (let i = 0; i < frictionEquations.length; i++) {
+      this.queryFrictionPool.push(frictionEquations[i])
+    }
+    contacts.length = 0
+    frictionEquations.length = 0
+
+    result.set(from, to, normal, point, shape, bestBody, length * bestT)
+    result.hasHit = true
+    return true
+  }
+
+  /**
+   * Check the body level filters of a shape query.
+   */
+  private matchesShapeQuery(body: Body, options: ShapeQueryOptions): boolean {
+    if (options.ignoreBody === body) {
+      return false
+    }
+
+    const group = options.collisionFilterGroup !== undefined ? options.collisionFilterGroup : 1
+    const mask = options.collisionFilterMask !== undefined ? options.collisionFilterMask : -1
+
+    if (!(body.collisionFilterGroup & mask)) {
+      return false
+    }
+
+    if (!(body.collisionFilterMask & group)) {
+      return false
+    }
+
+    return true
+  }
+
+  /**
+   * Test a body (all of its shapes) against a shape at a world transform.
+   */
+  private bodyOverlapsShape(body: Body, shape: Shape, position: Vec3, quaternion: Quaternion): boolean {
+    const shapes = body.shapes
+    const tmpPosition = this.queryTmpPosition
+    const tmpQuaternion = this.queryTmpQuaternion
+
+    for (let i = 0; i < shapes.length; i++) {
+      body.quaternion.mult(body.shapeOrientations[i], tmpQuaternion)
+      body.quaternion.vmult(body.shapeOffsets[i], tmpPosition)
+      tmpPosition.vadd(body.position, tmpPosition)
+
+      if (
+        this.queryNarrowphase.shapesOverlap(
+          shape,
+          position,
+          quaternion,
+          shapes[i],
+          tmpPosition,
+          tmpQuaternion,
+          this.queryBody,
+          body
+        )
+      ) {
+        return true
+      }
+    }
+
+    return false
+  }
+
+  /**
+   * Place the query shape on the internal query body, for narrowphase contact generation.
+   */
+  private setQueryShape(shape: Shape, position: Vec3, quaternion: Quaternion): void {
+    const queryBody = this.queryBody
+    queryBody.shapes.length = 0
+    queryBody.shapeOffsets.length = 0
+    queryBody.shapeOrientations.length = 0
+    queryBody.shapes.push(shape)
+    queryBody.shapeOffsets.push(this.queryShapeOffset)
+    queryBody.shapeOrientations.push(this.queryShapeOrientation)
+    queryBody.position.copy(position)
+    queryBody.quaternion.copy(quaternion)
   }
 
   /**
@@ -974,12 +1283,16 @@ export class World extends EventTarget {
       }
 
       const velocity = bi.velocity
-      const distance = velocity.length() * dt
+      const thresholdDistance = threshold * radius
+      const speedSquared = velocity.lengthSquared()
 
-      // Discrete collision detection is accurate enough for slow bodies
-      if (distance <= threshold * radius) {
+      // Discrete collision detection is accurate enough for slow bodies. Compare squared
+      // lengths so resting bodies do not pay for a square root every step.
+      if (speedSquared * dt * dt <= thresholdDistance * thresholdDistance) {
         continue
       }
+
+      const distance = Math.sqrt(speedSquared) * dt
 
       if (bi.aabbNeedsUpdate) {
         bi.updateAABB()

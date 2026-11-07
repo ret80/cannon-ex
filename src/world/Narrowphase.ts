@@ -53,6 +53,13 @@ export const COLLISION_TYPES = {
 
 export type CollisionType = typeof COLLISION_TYPES[keyof typeof COLLISION_TYPES]
 
+// Scratch storage for `shapesOverlap`, so boolean queries do not allocate results.
+const shapesOverlap_result: ContactEquation[] = []
+const shapesOverlap_frictionResult: FrictionEquation[] = []
+
+// Reused by `convexConvex` instead of allocating a new array for every convex pair.
+const convexConvex_result: ConvexPolyhedronContactPoint[] = []
+
 /**
  * Helper class for the World. Generates ContactEquations.
  * @todo Sphere-ConvexPolyhedron contacts
@@ -430,6 +437,62 @@ export class Narrowphase {
         }
       }
     }
+  }
+
+  /**
+   * Test if two shapes overlap at the given world transforms.
+   *
+   * This is the boolean variant of `getContacts`: it reuses the same collision resolvers
+   * but leaves no contacts behind. Useful for shape queries.
+   */
+  shapesOverlap(si: Shape, xi: Vec3, qi: Quaternion, sj: Shape, xj: Vec3, qj: Quaternion, bi: Body, bj: Body): boolean {
+    if (!(si.collisionFilterMask & sj.collisionFilterGroup && sj.collisionFilterMask & si.collisionFilterGroup)) {
+      return false
+    }
+
+    if (xi.distanceSquared(xj) > (si.boundingSphereRadius + sj.boundingSphereRadius) ** 2) {
+      return false
+    }
+
+    const resolver = this[(si.type | sj.type) as CollisionType]
+    if (!resolver) {
+      return false
+    }
+
+    // Keep the results of the caller (a running getContacts call) intact.
+    const result = this.result
+    const frictionResult = this.frictionResult
+    this.result = shapesOverlap_result
+    this.frictionResult = shapesOverlap_frictionResult
+    shapesOverlap_result.length = 0
+    shapesOverlap_frictionResult.length = 0
+
+    // Run the real contact generation instead of the resolvers' `justTest` shortcut: some
+    // resolvers only report a hit for certain configurations in test mode, while the contacts
+    // they generate are always reliable.
+    let overlap: boolean | void
+    if (si.type < sj.type) {
+      overlap = (resolver as any).call(this, si, sj, xi, xj, qi, qj, bi, bj, si, sj, false)
+    } else {
+      overlap = (resolver as any).call(this, sj, si, xj, xi, qj, qi, bj, bi, si, sj, false)
+    }
+
+    const isOverlapping = overlap === true || shapesOverlap_result.length > 0
+
+    // Some resolvers create equations even in test mode; recycle them instead of leaking.
+    for (let i = 0; i < shapesOverlap_result.length; i++) {
+      this.contactPointPool.push(shapesOverlap_result[i])
+    }
+    for (let i = 0; i < shapesOverlap_frictionResult.length; i++) {
+      this.frictionEquationPool.push(shapesOverlap_frictionResult[i])
+    }
+    shapesOverlap_result.length = 0
+    shapesOverlap_frictionResult.length = 0
+
+    this.result = result
+    this.frictionResult = frictionResult
+
+    return isOverlapping
   }
 
   sphereSphere(
@@ -814,7 +877,8 @@ export class Narrowphase {
     }
 
     if (si.findSeparatingAxis(sj, xi, qi, xj, qj, sepAxis, faceListA, faceListB)) {
-      const res: ConvexPolyhedronContactPoint[] = []
+      const res = convexConvex_result
+      res.length = 0
       const q = convexConvex_q
       si.clipAgainstHull(xi, qi, sj, xj, qj, sepAxis, -100, 100, res)
       let numContacts = 0
